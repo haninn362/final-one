@@ -1,5 +1,5 @@
 # ==================================================
-# SCRIPT FINAL UNIFIÉ - PFE HANIN
+# APPLICATION STREAMLIT - PFE HANIN
 # Base Stock + Prévisions (SES / Croston / SBA)
 # Sélection meilleure méthode + Simulation commandes
 # + Analyse de sensibilité
@@ -7,37 +7,40 @@
 
 import numpy as np
 import pandas as pd
-import re
 from scipy.stats import nbinom
 import streamlit as st
 
 # ---------- PARAMÈTRES ----------
-EXCEL_PATH = st.file_uploader("Upload Excel file", type=["xlsx"])
-PRODUCT_CODES = st.multiselect("Select product codes", ["EM0400","EM1499","EM1091","EM1523","EM0392","EM1526"])
+st.set_page_config(page_title="PFE HANIN - Base Stock", layout="wide")
 
-LEAD_TIME = 10
-LEAD_TIME_SUPPLIER = 3
-SERVICE_LEVEL = st.slider("Service Level", 0.80, 0.99, 0.95)
-NB_SIM = st.number_input("Number of simulations", 100, 5000, 1000, step=100)
-RNG_SEED = st.number_input("Random seed", 0, 9999, 42)
+st.title("📦 Application PFE HANIN")
+st.markdown("Méthode **Base Stock** + Prévisions (SES / Croston / SBA)")
+
+# Sidebar : paramètres
+st.sidebar.header("⚙️ Paramètres")
+uploaded_file = st.sidebar.file_uploader("Chargez le fichier Excel", type=["xlsx"])
+
+default_products = ["EM0400","EM1499","EM1091","EM1523","EM0392","EM1526"]
+PRODUCT_CODES = st.sidebar.multiselect("Choisir les produits", default_products, default=default_products)
+
+LEAD_TIME = st.sidebar.number_input("Lead time usine (jours)", 1, 60, 10)
+LEAD_TIME_SUPPLIER = st.sidebar.number_input("Lead time fournisseur (jours)", 1, 60, 3)
+SERVICE_LEVEL = st.sidebar.slider("Service level (par défaut)", 0.80, 0.99, 0.95)
+NB_SIM = st.sidebar.number_input("Nombre de simulations", 100, 5000, 1000, step=100)
+RNG_SEED = 42
 
 ALPHAS = [0.1, 0.2, 0.3, 0.4]
 WINDOW_RATIOS = [0.6, 0.7, 0.8]
 RECALC_INTERVALS = [5, 10, 20]
-
-SERVICE_LEVELS = [0.90, 0.92, 0.95, 0.98]   # Sensibilité
+SERVICE_LEVELS = [0.90, 0.92, 0.95, 0.98]
 
 # ==================================================
 # PARTIE 1 : Qr* et Qw* (Base Stock)
 # ==================================================
-def _find_product_sheet(excel_path: str, code: str) -> str:
+def _find_product_sheet(excel_path, code: str) -> str:
     xls = pd.ExcelFile(excel_path)
     sheets = [s.strip().lower() for s in xls.sheet_names]
-    targets = [
-        f"time serie {code}".lower(),
-        f"time series {code}".lower(),
-        code.lower()
-    ]
+    targets = [f"time serie {code}".lower(), f"time series {code}".lower(), code.lower()]
     for t in targets:
         if t in sheets:
             return xls.sheet_names[sheets.index(t)]
@@ -114,8 +117,7 @@ def load_matrix_timeseries(excel_path, sheet_name):
     df.columns = new_cols
     return df, prod_col
 
-def rolling_forecast_with_metrics(excel_path, product_code, sheet_name,
-                                  alpha, window_ratio, interval, method):
+def rolling_forecast_with_metrics(excel_path, product_code, sheet_name, alpha, window_ratio, interval, method):
     df, prod_col = load_matrix_timeseries(excel_path, sheet_name)
     row = df.loc[df[prod_col] == product_code]
     if row.empty:
@@ -142,11 +144,7 @@ def rolling_forecast_with_metrics(excel_path, product_code, sheet_name,
                 f = croston_or_sba_forecast(train, alpha, "sba")
             else:
                 f = 0.0
-            out_rows.append({
-                "real_demand": real_demand,
-                "forecast": f,
-                "error": real_demand - f
-            })
+            out_rows.append({"real_demand": real_demand, "forecast": f, "error": real_demand - f})
     return pd.DataFrame(out_rows)
 
 def compute_metrics(df_run):
@@ -158,7 +156,7 @@ def compute_metrics(df_run):
     absME = e.abs().mean()
     return absME, MSE, RMSE
 
-def grid_search_all_methods():
+def grid_search_all_methods(file_path):
     candidates = []
     for code in PRODUCT_CODES:
         for method in ["ses","croston","sba"]:
@@ -166,15 +164,11 @@ def grid_search_all_methods():
             for a in ALPHAS:
                 for w in WINDOW_RATIOS:
                     for itv in RECALC_INTERVALS:
-                        df_run = rolling_forecast_with_metrics(
-                            EXCEL_PATH, code, "classification",
-                            a, w, itv, method
-                        )
+                        df_run = rolling_forecast_with_metrics(file_path, code, "classification", a, w, itv, method)
                         absME, MSE, RMSE = compute_metrics(df_run)
                         metrics_rows.append({
-                            "code": code, "method": method,
-                            "alpha": a, "window_ratio": w,
-                            "recalc_interval": itv,
+                            "code": code, "method": method, "alpha": a,
+                            "window_ratio": w, "recalc_interval": itv,
                             "absME": absME, "MSE": MSE, "RMSE": RMSE
                         })
             df_metrics = pd.DataFrame(metrics_rows)
@@ -182,23 +176,20 @@ def grid_search_all_methods():
     return pd.concat(candidates, ignore_index=True)
 
 # ==================================================
-# PARTIE 3 : Simulation finale avec ROP (comme ton code initial)
+# PARTIE 3 : Simulation finale avec ROP
 # ==================================================
 def _interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
     s, e = start_idx + 1, start_idx + 1 + interval
     return float(pd.Series(daily).iloc[s:e].sum())
 
-def simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL):
+def simulate_orders(file_path, best_per_code, qr_map, service_level=SERVICE_LEVEL):
     results = []
     rng = np.random.default_rng(RNG_SEED)
     for _, row in best_per_code.iterrows():
-        code = row["code"]
-        method = row["method"]
-        alpha = row["alpha"]
-        window_ratio = row["window_ratio"]
-        interval = int(row["recalc_interval"])
-        sheet = _find_product_sheet(EXCEL_PATH, code)
-        df = pd.read_excel(EXCEL_PATH, sheet_name=sheet)
+        code = row["code"]; method = row["method"]
+        alpha = row["alpha"]; window_ratio = row["window_ratio"]; interval = int(row["recalc_interval"])
+        sheet = _find_product_sheet(file_path, code)
+        df = pd.read_excel(file_path, sheet_name=sheet)
         dates = pd.to_datetime(df.iloc[:,0], errors="coerce")
         stock_col = pd.to_numeric(df.iloc[:,1], errors="coerce").astype(float)
         cons_col = pd.to_numeric(df.iloc[:,2], errors="coerce").fillna(0.0).astype(float)
@@ -209,28 +200,22 @@ def simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL):
         stock_daily = ts_stock.reindex(full_idx).ffill().fillna(0.0)
         vals = cons_daily.values
         split_index = int(len(vals) * window_ratio)
-        if split_index < 2:
-            continue
+        if split_index < 2: continue
         stock_after_interval = 0.0
         for i in range(split_index, len(vals)):
             if (i - split_index) % interval == 0:
                 train = vals[:i]
-                if method == "ses":
-                    f = ses_forecast(train, alpha)
-                elif method == "croston":
-                    f = croston_or_sba_forecast(train, alpha, "croston")
-                else:
-                    f = croston_or_sba_forecast(train, alpha, "sba")
+                if method == "ses": f = ses_forecast(train, alpha)
+                elif method == "croston": f = croston_or_sba_forecast(train, alpha, "croston")
+                else: f = croston_or_sba_forecast(train, alpha, "sba")
                 sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
                 sigma_period = sigma_period if np.isfinite(sigma_period) else 0.0
-                # ROP usine
                 X_Lt = LEAD_TIME * f
                 sigma_Lt = sigma_period * np.sqrt(max(LEAD_TIME, 1e-9))
                 var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt+1e-5
                 p_nb = min(max(X_Lt/var_u, 1e-12),1-1e-12)
                 r_nb = X_Lt**2/(var_u - X_Lt) if var_u > X_Lt else 1e6
                 ROP_u = float(np.percentile(nbinom.rvs(r_nb, p_nb, size=NB_SIM, random_state=rng), 100*service_level))
-                # ROP fournisseur
                 totalL = LEAD_TIME + LEAD_TIME_SUPPLIER
                 X_Lt_Lw = totalL * f
                 sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
@@ -238,11 +223,9 @@ def simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL):
                 p_nb_f = min(max(X_Lt_Lw/var_f, 1e-12),1-1e-12)
                 r_nb_f = X_Lt_Lw**2/(var_f - X_Lt_Lw) if var_f > X_Lt_Lw else 1e6
                 ROP_f = float(np.percentile(nbinom.rvs(r_nb_f, p_nb_f, size=NB_SIM, random_state=rng), 100*service_level))
-                # Demande réelle et stocks
                 real_demand = _interval_sum_next_days(cons_daily, i, interval)
                 stock_on_hand_running = _interval_sum_next_days(stock_daily, i, interval)
                 stock_after_interval = stock_after_interval + stock_on_hand_running - real_demand
-                # Politique de commande
                 if stock_after_interval >= real_demand * LEAD_TIME:
                     order_policy = "no_order"
                 else:
@@ -250,33 +233,22 @@ def simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL):
                     stock_after_interval += qr_map[code]
                 stock_status = "rupture" if real_demand > ROP_u else "holding"
                 results.append({
-                    "date": cons_daily.index[i].date(),
-                    "code": code,
-                    "interval": interval,
-                    "real_demand": real_demand,
-                    "stock_on_hand_running": stock_on_hand_running,
-                    "stock_after_interval": stock_after_interval,
-                    "order_policy": order_policy,
-                    "Qr_star": qr_map[code],
-                    "reorder_point_usine": ROP_u,
-                    "reorder_point_fournisseur": ROP_f,
-                    "stock_status": stock_status,
+                    "date": cons_daily.index[i].date(), "code": code, "interval": interval,
+                    "real_demand": real_demand, "stock_on_hand_running": stock_on_hand_running,
+                    "stock_after_interval": stock_after_interval, "order_policy": order_policy,
+                    "Qr_star": qr_map[code], "reorder_point_usine": ROP_u,
+                    "reorder_point_fournisseur": ROP_f, "stock_status": stock_status,
                     "service_level": service_level
                 })
-        # affichage par produit
-        st.write(f"\n=== Final Results for {code} ({method.upper()}) SL={service_level} ===")
-        df_display = pd.DataFrame(results)[pd.DataFrame(results)["code"] == code]
-        display(df_display.head(20))
     return pd.DataFrame(results)
 
 # ==================================================
 # PARTIE 4 : Analyse de sensibilité
 # ==================================================
-def run_sensitivity(best_per_code, qr_map):
+def run_sensitivity(file_path, best_per_code, qr_map):
     all_results = []
     for sl in SERVICE_LEVELS:
-        st.write(f"\n🔎 Sensibilité pour Service Level = {sl*100:.0f}%")
-        df_run = simulate_orders(best_per_code, qr_map, service_level=sl)
+        df_run = simulate_orders(file_path, best_per_code, qr_map, service_level=sl)
         if not df_run.empty:
             summary = df_run.groupby("code").agg(
                 ROP_u_moy=("reorder_point_usine","mean"),
@@ -285,47 +257,34 @@ def run_sensitivity(best_per_code, qr_map):
                 rupture_pct=("stock_status", lambda s: (s=="rupture").mean()*100),
                 Qr_star=("Qr_star","first")
             ).reset_index()
-            st.write(f"\n=== Résumé SL={sl:.2f} ===")
-            display(summary)
+            st.write(f"### Résumé pour SL={sl:.2f}")
+            st.dataframe(summary)
             all_results.append(df_run)
     return pd.concat(all_results, ignore_index=True)
 
 # ==================================================
-# MAIN
+# MAIN STREAMLIT
 # ==================================================
-st.title("📦 Stock Forecasting & Simulation App")
-
-# --- Step 1: Qr* et Qw* ---
-if st.button("Compute Qr* and Qw*"):
-    qr_map, qw_map = compute_qstars(EXCEL_PATH, PRODUCT_CODES)
-    st.subheader("Qr* et Qw*")
-    st.write("Qr* :", qr_map)
-    st.write("Qw* :", qw_map)
-
-# --- Step 2: Grid Search & Best Method ---
-if st.button("Run Grid Search"):
-    all_candidates = grid_search_all_methods()
-    idx = all_candidates.groupby("code")["RMSE"].idxmin()
-    best_per_code = all_candidates.loc[idx].reset_index(drop=True)
-
-    st.subheader("✅ Best Method per Product (RMSE)")
-    st.dataframe(best_per_code)
-
-    st.markdown("### Résumé")
-    for _, r in best_per_code.iterrows():
-        st.markdown(
-            f"• **{r['code']}**: {r['method'].upper()} | RMSE={r['RMSE']:.4g} "
-            f"| α={r['alpha']}, win={r['window_ratio']}, itv={int(r['recalc_interval'])}"
-        )
-
-# --- Step 3: Final Simulation ---
-if st.button("Run Final Simulation (SL=0.95)"):
-    final_results = simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL)
-    st.subheader("Final Simulation Results")
-    st.dataframe(final_results)
-
-# --- Step 4: Sensitivity Analysis ---
-if st.button("Run Sensitivity Analysis"):
-    sensitivity_results = run_sensitivity(best_per_code, qr_map)
-    st.subheader("Sensitivity Analysis Results")
-    st.dataframe(sensitivity_results)
+if uploaded_file is not None:
+    with st.spinner("⏳ Calcul en cours..."):
+        qr_map, qw_map = compute_qstars(uploaded_file, PRODUCT_CODES)
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Base Stock", "🔮 Prévisions", "📦 Simulation", "📈 Sensibilité"])
+        with tab1:
+            st.subheader("Qr* et Qw* (Base Stock)")
+            st.json({"Qr*": qr_map, "Qw*": qw_map})
+        with tab2:
+            st.subheader("Meilleure méthode de prévision")
+            all_candidates = grid_search_all_methods(uploaded_file)
+            idx = all_candidates.groupby("code")["RMSE"].idxmin()
+            best_per_code = all_candidates.loc[idx].reset_index(drop=True)
+            st.dataframe(best_per_code)
+        with tab3:
+            st.subheader(f"Simulation finale (SL={SERVICE_LEVEL:.2f})")
+            final_results = simulate_orders(uploaded_file, best_per_code, qr_map, service_level=SERVICE_LEVEL)
+            st.dataframe(final_results.head(50))
+        with tab4:
+            st.subheader("Analyse de sensibilité")
+            sensitivity_results = run_sensitivity(uploaded_file, best_per_code, qr_map)
+            st.dataframe(sensitivity_results.head(50))
+else:
+    st.info("📥 Veuillez charger un fichier Excel pour commencer.")

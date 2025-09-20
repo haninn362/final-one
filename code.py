@@ -1,26 +1,21 @@
 # ============================================================
-# STREAMLIT APP – Fusion des 2 codes
-# Contient :
+# STREAMLIT APP – Forecasting Project
+# Contains:
 # - Croston
 # - SES
 # - SBA
-# - Unified Final (Q*, sensibilité, politiques de commande, exports)
+# - Unified Final (Q*, sensitivity, order policies, exports)
 # ============================================================
 
+import streamlit as st
 import numpy as np
 import pandas as pd
 from scipy.stats import nbinom
-import streamlit as st
+import datetime as dt
 
 # ============================================================
-# CONFIGURATION STREAMLIT
+# CONFIGURATION GLOBALE
 # ============================================================
-st.title("📊 Forecasting App – Croston, SES, SBA")
-st.write("Upload your Excel file and run Grid Search + Final Evaluation")
-
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
-SHEET_NAME = st.text_input("Excel sheet name", value="classification")
-
 ALPHAS = [0.1, 0.2, 0.3, 0.4]
 WINDOW_RATIOS = [0.6, 0.7, 0.8]
 RECALC_INTERVALS = [5, 10, 20]
@@ -33,17 +28,11 @@ RNG_SEED = 42
 
 SERVICE_LEVELS = [0.90, 0.92, 0.95, 0.98]
 
+SAVE_CSV = True
+
 # ============================================================
 # FONCTIONS UTILITAIRES
 # ============================================================
-def _disp(obj, n=None, title=None):
-    if title:
-        st.subheader(title)
-    if isinstance(obj, pd.DataFrame):
-        st.dataframe(obj.head(n) if n else obj)
-    else:
-        st.write(obj)
-
 def load_matrix_timeseries(excel_file, sheet_name):
     df = pd.read_excel(excel_file, sheet_name=sheet_name)
     prod_col = df.columns[0]
@@ -178,14 +167,14 @@ def rolling_run(method, excel_file, product_code, sheet_name,
 # ============================================================
 # GRID SEARCH
 # ============================================================
-def grid_search(method, excel_file, codes):
+def grid_search(method, excel_file, sheet_name, codes):
     best_rows = []
     for code in codes:
         metrics_rows = []
         for a in ALPHAS:
             for w in WINDOW_RATIOS:
                 for itv in RECALC_INTERVALS:
-                    df_run = rolling_run(method, excel_file, code, SHEET_NAME,
+                    df_run = rolling_run(method, excel_file, code, sheet_name,
                                          a, w, itv, LEAD_TIME, LEAD_TIME_SUPPLIER,
                                          SERVICE_LEVEL, NB_SIM, RNG_SEED)
                     ME, absME, MSE, RMSE = compute_metrics(df_run)
@@ -207,39 +196,45 @@ def grid_search(method, excel_file, codes):
     return pd.DataFrame(best_rows)
 
 # ============================================================
-# MAIN STREAMLIT APP
+# STREAMLIT APP
 # ============================================================
+st.title("📊 Demand Forecasting (Croston, SES, SBA)")
+
+uploaded_file = st.file_uploader("Upload your Excel file (articles.xlsx)", type=["xlsx"])
+
 if uploaded_file is not None:
+    SHEET_NAME = "classification"
     df, prod_col = load_matrix_timeseries(uploaded_file, SHEET_NAME)
     CODES_PRODUITS = df[prod_col].dropna().unique().tolist()
 
-    st.success("✅ File loaded successfully!")
-
-    st.write("### Running Grid Search...")
-
-    best_ses = grid_search("ses", uploaded_file, CODES_PRODUITS)
-    best_cro = grid_search("croston", uploaded_file, CODES_PRODUITS)
-    best_sba = grid_search("sba", uploaded_file, CODES_PRODUITS)
-
-    st.write("#### Best Parameters (SES)")
+    # Grid searches
+    st.subheader("=== Grid Search SES ===")
+    best_ses = grid_search("ses", uploaded_file, SHEET_NAME, CODES_PRODUITS)
     st.dataframe(best_ses)
-    st.write("#### Best Parameters (Croston)")
+
+    st.subheader("=== Grid Search Croston ===")
+    best_cro = grid_search("croston", uploaded_file, SHEET_NAME, CODES_PRODUITS)
     st.dataframe(best_cro)
-    st.write("#### Best Parameters (SBA)")
+
+    st.subheader("=== Grid Search SBA ===")
+    best_sba = grid_search("sba", uploaded_file, SHEET_NAME, CODES_PRODUITS)
     st.dataframe(best_sba)
 
+    # Best params
     best_all = pd.concat([
         best_ses.assign(method="SES"),
         best_cro.assign(method="CROSTON"),
         best_sba.assign(method="SBA")
     ])
     best_final = best_all.loc[best_all.groupby("code")["best_RMSE"].idxmin()]
-    _disp(best_final, title="Meilleure méthode par article")
 
-    # Recalcul final multi-SL
+    st.subheader("✅ Meilleure méthode et meilleurs paramètres par article")
+    st.dataframe(best_final)
+
+    # Recalculate for service levels
     final_results = []
     for sl in SERVICE_LEVELS:
-        st.write(f"### Recalcul final avec SL={sl}")
+        st.subheader(f"▶️ Recalcul final avec SL={sl}")
         for _, row in best_final.iterrows():
             code = row["code"]
             method = row["method"].lower()
@@ -253,12 +248,16 @@ if uploaded_file is not None:
             df_run["method"] = method
             df_run["service_level"] = sl
             final_results.append(df_run)
+        if final_results:
+            st.dataframe(pd.concat(final_results, ignore_index=True).head(50))
 
     df_final = pd.concat(final_results, ignore_index=True)
-    _disp(df_final.head(50), title="Aperçu résultats finaux")
+
+    st.subheader("Aperçu résultats finaux (95%)")
+    st.dataframe(df_final[df_final["service_level"] == 0.95].head(50))
 
     # Download button
-    csv = df_final.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Final Results", csv, "final_results.csv", "text/csv")
+    st.download_button("📥 Download All Results (CSV)", df_final.to_csv(index=False),
+                       "final_results.csv", "text/csv")
 else:
-    st.info("👆 Please upload an Excel file to start.")
+    st.info("Please upload an Excel file to start the analysis.")

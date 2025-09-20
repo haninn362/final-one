@@ -1,22 +1,25 @@
-import streamlit as st
+# ==================================================
+# SCRIPT FINAL UNIFIÉ - PFE HANIN
+# Base Stock + Prévisions (SES / Croston / SBA)
+# Sélection meilleure méthode + Simulation commandes
+# + Analyse de sensibilité
+# ==================================================
+
 import numpy as np
 import pandas as pd
 import re
 from scipy.stats import nbinom
-
-# ==================================================
-# SCRIPT FINAL UNIFIÉ - PFE HANIN (Streamlit version)
-# ==================================================
+import streamlit as st
 
 # ---------- PARAMÈTRES ----------
-EXCEL_PATH = "PFE  HANIN (1).xlsx"
-PRODUCT_CODES = ["EM0400","EM1499","EM1091","EM1523","EM0392","EM1526"]
+EXCEL_PATH = st.file_uploader("Upload Excel file", type=["xlsx"])
+PRODUCT_CODES = st.multiselect("Select product codes", ["EM0400","EM1499","EM1091","EM1523","EM0392","EM1526"])
 
 LEAD_TIME = 10
 LEAD_TIME_SUPPLIER = 3
-SERVICE_LEVEL = 0.95
-NB_SIM = 1000
-RNG_SEED = 42
+SERVICE_LEVEL = st.slider("Service Level", 0.80, 0.99, 0.95)
+NB_SIM = st.number_input("Number of simulations", 100, 5000, 1000, step=100)
+RNG_SEED = st.number_input("Random seed", 0, 9999, 42)
 
 ALPHAS = [0.1, 0.2, 0.3, 0.4]
 WINDOW_RATIOS = [0.6, 0.7, 0.8]
@@ -179,7 +182,7 @@ def grid_search_all_methods():
     return pd.concat(candidates, ignore_index=True)
 
 # ==================================================
-# PARTIE 3 : Simulation finale avec ROP
+# PARTIE 3 : Simulation finale avec ROP (comme ton code initial)
 # ==================================================
 def _interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
     s, e = start_idx + 1, start_idx + 1 + interval
@@ -261,9 +264,9 @@ def simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL):
                     "service_level": service_level
                 })
         # affichage par produit
-        st.write(f"=== Final Results for {code} ({method.upper()}) SL={service_level} ===")
+        st.write(f"\n=== Final Results for {code} ({method.upper()}) SL={service_level} ===")
         df_display = pd.DataFrame(results)[pd.DataFrame(results)["code"] == code]
-        st.dataframe(df_display.head(20))
+        display(df_display.head(20))
     return pd.DataFrame(results)
 
 # ==================================================
@@ -272,7 +275,7 @@ def simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL):
 def run_sensitivity(best_per_code, qr_map):
     all_results = []
     for sl in SERVICE_LEVELS:
-        st.write(f"🔎 Sensibilité pour Service Level = {sl*100:.0f}%")
+        st.write(f"\n🔎 Sensibilité pour Service Level = {sl*100:.0f}%")
         df_run = simulate_orders(best_per_code, qr_map, service_level=sl)
         if not df_run.empty:
             summary = df_run.groupby("code").agg(
@@ -282,47 +285,47 @@ def run_sensitivity(best_per_code, qr_map):
                 rupture_pct=("stock_status", lambda s: (s=="rupture").mean()*100),
                 Qr_star=("Qr_star","first")
             ).reset_index()
-            st.write(f"=== Résumé SL={sl:.2f} ===")
-            st.dataframe(summary)
+            st.write(f"\n=== Résumé SL={sl:.2f} ===")
+            display(summary)
             all_results.append(df_run)
     return pd.concat(all_results, ignore_index=True)
 
 # ==================================================
-# MAIN (Streamlit)
+# MAIN
 # ==================================================
-def main():
-    st.title("📊 PFE HANIN – Stock & Prévisions")
+st.title("📦 Stock Forecasting & Simulation App")
 
-    if st.button("▶ Run Full Simulation"):
-        # Qr* et Qw*
-        qr_map, qw_map = compute_qstars(EXCEL_PATH, PRODUCT_CODES)
-        st.subheader("Qr* et Qw*")
-        st.write("Qr* :", qr_map)
-        st.write("Qw* :", qw_map)
+# --- Step 1: Qr* et Qw* ---
+if st.button("Compute Qr* and Qw*"):
+    qr_map, qw_map = compute_qstars(EXCEL_PATH, PRODUCT_CODES)
+    st.subheader("Qr* et Qw*")
+    st.write("Qr* :", qr_map)
+    st.write("Qw* :", qw_map)
 
-        # Grid search & sélection meilleure méthode
-        all_candidates = grid_search_all_methods()
-        idx = all_candidates.groupby("code")["RMSE"].idxmin()
-        best_per_code = all_candidates.loc[idx].reset_index(drop=True)
+# --- Step 2: Grid Search & Best Method ---
+if st.button("Run Grid Search"):
+    all_candidates = grid_search_all_methods()
+    idx = all_candidates.groupby("code")["RMSE"].idxmin()
+    best_per_code = all_candidates.loc[idx].reset_index(drop=True)
 
-        st.subheader("✅ Meilleure méthode par article (critère: RMSE)")
-        st.dataframe(best_per_code)
+    st.subheader("✅ Best Method per Product (RMSE)")
+    st.dataframe(best_per_code)
 
-        # Résumé
-        st.subheader("Résumé")
-        for _, r in best_per_code.iterrows():
-            st.write(f"• {r['code']}: {r['method'].upper()} | RMSE={r['RMSE']:.4g} | "
-                     f"α={r['alpha']}, win={r['window_ratio']}, itv={int(r['recalc_interval'])}")
+    st.markdown("### Résumé")
+    for _, r in best_per_code.iterrows():
+        st.markdown(
+            f"• **{r['code']}**: {r['method'].upper()} | RMSE={r['RMSE']:.4g} "
+            f"| α={r['alpha']}, win={r['window_ratio']}, itv={int(r['recalc_interval'])}"
+        )
 
-        # Simulation finale SL=0.95
-        st.subheader("Simulation finale (SL=0.95)")
-        final_results = simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL)
-        st.dataframe(final_results.head(50))
+# --- Step 3: Final Simulation ---
+if st.button("Run Final Simulation (SL=0.95)"):
+    final_results = simulate_orders(best_per_code, qr_map, service_level=SERVICE_LEVEL)
+    st.subheader("Final Simulation Results")
+    st.dataframe(final_results)
 
-        # 🔥 Analyse de sensibilité multi-SL
-        st.subheader("Analyse de sensibilité")
-        sensitivity_results = run_sensitivity(best_per_code, qr_map)
-        st.dataframe(sensitivity_results.head(50))
-
-if __name__ == "__main__":
-    main()
+# --- Step 4: Sensitivity Analysis ---
+if st.button("Run Sensitivity Analysis"):
+    sensitivity_results = run_sensitivity(best_per_code, qr_map)
+    st.subheader("Sensitivity Analysis Results")
+    st.dataframe(sensitivity_results)

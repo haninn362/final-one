@@ -1,22 +1,36 @@
 # ==================================================
 # STREAMLIT APP - PFE HANIN
 # Base Stock + Prévisions (SES / Croston / SBA)
+# Sélection meilleure méthode + Simulation commandes
+# + Analyse de sensibilité
 # ==================================================
 
 import streamlit as st
-import numpy as np
 import pandas as pd
+import numpy as np
+from scipy.stats import nbinom
 
-# ---------- PARAMETERS ----------
+# ---------- PARAMÈTRES ----------
 EXCEL_PATH = "PFE  HANIN (1).xlsx"
 PRODUCT_CODES = ["EM0400","EM1499","EM1091","EM1523","EM0392","EM1526"]
+
+LEAD_TIME = 10
+LEAD_TIME_SUPPLIER = 3
+SERVICE_LEVEL = 0.95
+NB_SIM = 1000
 
 ALPHAS = [0.1, 0.2, 0.3, 0.4]
 WINDOW_RATIOS = [0.6, 0.7, 0.8]
 RECALC_INTERVALS = [5, 10, 20]
+SERVICE_LEVELS = [0.90, 0.92, 0.95, 0.98]
 
+# ==================================================
+# Caching Excel loading
+# ==================================================
+@st.cache_data
+def load_excel(path):
+    return pd.ExcelFile(path)
 
-# ---------- CACHING ----------
 @st.cache_data
 def load_matrix_timeseries(excel_path, sheet_name):
     df = pd.read_excel(excel_path, sheet_name=sheet_name)
@@ -30,8 +44,12 @@ def load_matrix_timeseries(excel_path, sheet_name):
     df.columns = new_cols
     return df, prod_col
 
+xls = load_excel(EXCEL_PATH)
+df_classification, prod_col = load_matrix_timeseries(EXCEL_PATH, "classification")
 
-# ---------- FORECASTING ----------
+# ==================================================
+# Forecasting methods
+# ==================================================
 def ses_forecast(x, alpha=0.2):
     if len(x) == 0:
         return 0.0
@@ -104,11 +122,8 @@ def compute_metrics(df_run):
     absME = e.abs().mean()
     return absME, MSE, RMSE
 
-
-# ---------- GRID SEARCH ----------
 @st.cache_data
-def grid_search_all_methods(excel_path):
-    df_classification, prod_col = load_matrix_timeseries(excel_path, "classification")
+def grid_search_all_methods(df, prod_col):
     candidates = []
     for code in PRODUCT_CODES:
         metrics_rows = []
@@ -117,7 +132,7 @@ def grid_search_all_methods(excel_path):
                 for w in WINDOW_RATIOS:
                     for itv in RECALC_INTERVALS:
                         df_run = rolling_forecast_with_metrics(
-                            df_classification, prod_col, code,
+                            df, prod_col, code,
                             a, w, itv, method
                         )
                         absME, MSE, RMSE = compute_metrics(df_run)
@@ -131,19 +146,22 @@ def grid_search_all_methods(excel_path):
         candidates.append(df_metrics)
     return pd.concat(candidates, ignore_index=True)
 
+# ==================================================
+# MAIN STREAMLIT APP
+# ==================================================
+st.title("📊 PFE HANIN - Base Stock + Prévisions")
 
-# ---------- STREAMLIT UI ----------
-st.title("📊 PFE HANIN - Base Stock + Forecasting")
+if st.button("Run Grid Search"):
+    all_candidates = grid_search_all_methods(df_classification, prod_col)
+    idx = all_candidates.groupby("code")["RMSE"].idxmin()
+    best_per_code = all_candidates.loc[idx].reset_index(drop=True)
 
-st.write("Running grid search on SES / Croston / SBA ...")
+    st.subheader("✅ Meilleure méthode par article (critère: RMSE)")
+    st.dataframe(best_per_code)
 
-all_candidates = grid_search_all_methods(EXCEL_PATH)
-idx = all_candidates.groupby("code")["RMSE"].idxmin()
-best_per_code = all_candidates.loc[idx].reset_index(drop=True)
-
-st.subheader("✅ Meilleure méthode par article (critère: RMSE)")
-
-# Show formatted results like your screenshot
-for _, r in best_per_code.iterrows():
-    st.write(f"• {r['code']}: {r['method'].upper()} | RMSE={r['RMSE']:.4g} | "
-             f"α={r['alpha']}, win={r['window_ratio']}, itv={int(r['recalc_interval'])}")
+    st.subheader("--- Résumé ---")
+    for _, r in best_per_code.iterrows():
+        st.write(f"• {r['code']}: {r['method'].upper()} | "
+                 f"RMSE={r['RMSE']:.4g} | "
+                 f"α={r['alpha']}, win={r['window_ratio']}, "
+                 f"itv={int(r['recalc_interval'])}")

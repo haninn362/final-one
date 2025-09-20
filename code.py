@@ -1,26 +1,36 @@
 # ============================================
 # Streamlit App – Unifié (Final + Sensibilité)
-# Robust to sheet/column name variations + defensive best-params selection
+# Minimal changes: original logic preserved, wrapped for Streamlit UI
+# + Uploader for articles.xlsx (classification sheet) with code extraction
 # ============================================
 
-import re
 import numpy as np
 import pandas as pd
+import re
 from scipy.stats import nbinom
 import streamlit as st
 
 st.set_page_config(page_title="Inventaire – Final & Sensibilité", layout="wide")
 
 # ============================================
-# --------- DEFAULTS (can be overridden via sidebar uploads) ---------
+# --------- CHEMINS / LISTES (defaults) ---------
+# (Can be overridden via the Streamlit sidebar uploaders.)
 # ============================================
+EXCEL_PATH_DATA_DEFAULT = "PFE  HANIN (1).xlsx"           # données par produit (onglets "time serie XXX")
+PATH_SES_DEFAULT = "best_params_SES.xlsx"
+PATH_CROSTON_DEFAULT = "best_params_CROSTON.xlsx"
+PATH_SBA_DEFAULT = "best_params_SBA.xlsx"
+
 CODES_PRODUITS_DEFAULT = ["EM0400", "EM1499", "EM1091", "EM1523", "EM0392", "EM1526"]
-DELAI_USINE_DEFAULT = 10
-DELAI_FOURNISSEUR_DEFAULT = 3
+
+# --------- PARAMÈTRES SUPPLY / ROP ---------
+DELAI_USINE_DEFAULT = 10            # jours
+DELAI_FOURNISSEUR_DEFAULT = 3       # jours
 NIVEAU_SERVICE_DEF_DEFAULT = 0.95
 NB_SIM_DEFAULT = 1000
 GRAINE_ALEA_DEFAULT = 42
 
+# --------- COLONNES D'AFFICHAGE ---------
 COLONNES_AFFICHAGE = [
     "date", "code", "methode", "intervalle",
     "demande_reelle", "stock_disponible_intervalle", "stock_apres_intervalle",
@@ -30,8 +40,9 @@ COLONNES_AFFICHAGE = [
     "statut_stock", "service_level"
 ]
 
-# --------- UI-friendly display ---------
+# --------- OUTILS AFFICHAGE ---------
 def _disp(obj, n=None, title=None):
+    """Display helper that works in Streamlit and falls back to print"""
     try:
         if title:
             st.subheader(title)
@@ -47,98 +58,57 @@ def _disp(obj, n=None, title=None):
         else:
             print(obj)
 
-# --------- Column/sheet normalization helpers ---------
-def _norm_text(s: str) -> str:
-    s = re.sub(r"[\u00A0\t\r\n]+", " ", str(s))
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
-
-def _build_name_map(cols):
-    norm = {c: _norm_text(c) for c in cols}
-    inv = {}
-    for k, v in norm.items():
-        if v not in inv:
-            inv[v] = k
-    return norm, inv
-
-def _find_col(df: pd.DataFrame, candidates, regex=False, required=True, fallback_idx=None):
-    """Find a column by candidate names or regex on normalized names."""
-    _, inv = _build_name_map(df.columns)
-    # direct normalized name hit
-    for cand in candidates:
-        key = _norm_text(cand)
-        if key in inv:
-            return inv[key]
-    # regex search on normalized names
-    names_norm = list(inv.keys())
-    for cand in candidates:
-        pat = cand if regex else re.escape(_norm_text(cand))
-        rx = re.compile(pat)
-        for nn in names_norm:
-            if rx.search(nn):
-                return inv[nn]
-    if fallback_idx is not None and 0 <= fallback_idx < len(df.columns):
-        return df.columns[fallback_idx]
-    if required:
-        raise KeyError(f"Aucune colonne trouvée pour {candidates}")
-    return None
-
 # ======================================================
-# PARTIE A : Q* (Qr*, Qw*, n*)
+# PARTIE A : Q* (Qr*, Qw*, n*) depuis PFE HANIN
 # ======================================================
+
 def _trouver_feuille_produit(chemin_excel, code: str) -> str:
     xls = pd.ExcelFile(chemin_excel)
     feuilles = xls.sheet_names
-    for t in [
-        f"time serie {code}", f"time series {code}", f"time-série {code}", f"time série {code}"
-    ]:
-        if t in feuilles:
-            return t
-    patt = re.compile(r"time\s*ser(i|ie|ies|ié|iés)s?\s*", re.IGNORECASE)
-    cand = [s for s in feuilles if patt.search(_norm_text(s)) and code.lower() in _norm_text(s)]
+    cible = f"time serie {code}"
+    if cible in feuilles:
+        return cible
+    patt = re.compile(r"time\s*ser(i|ie)s?\s*", re.IGNORECASE)
+    cand = [s for s in feuilles if patt.search(s) and code.lower() in s.lower()]
     if cand:
         return sorted(cand, key=len, reverse=True)[0]
+    # parfois "time series"
+    alt = f"time series {code}"
+    if alt in feuilles:
+        return alt
     raise ValueError(f"[Feuille] Onglet pour '{code}' introuvable dans le classeur fourni.")
 
 def compute_qstars(chemin_excel, codes: list):
-    """Calcule Qr*, Qw*, n* (tolérant noms/espaces/retours à la ligne)."""
-    df_conso_raw = pd.read_excel(chemin_excel, sheet_name="consommation depots externe")
-    dfc = df_conso_raw.copy()
-    code_col = _find_col(dfc, [r"^code\s*produit$", r"\bcode\b"], regex=True)
-    qty_col  = _find_col(dfc, [r"^quantit[eé]\s*stial$", r"quantit[eé]", r"qty", r"quantit[eé].*total"], regex=True)
-    df_conso = dfc.groupby(code_col)[qty_col].sum()
+    """
+    Calcule Qr*, Qw*, n* pour chaque article.
+    Retourne trois dicts : qr_map, qw_map, n_map
+    """
+    df_conso = pd.read_excel(chemin_excel, sheet_name="consommation depots externe")
+    df_conso = df_conso.groupby('Code Produit')['Quantite STIAL'].sum()
 
     qr_map, qw_map, n_map = {}, {}, {}
-    cr_pats = [r"^cr\s*:\s*cout\s*stockage/?article", r"^cr\b.*stockage.*article"]
-    cw_pats = [r"^cw\s*:\s*cout\s*stockage.*chez\s*f", r"^cw\b.*stockage.*chez\s*f"]
-    aw_pats = [r"^aw\s*:\s*cout\s*de\s*lancement.*u", r"^aw\b.*lancement.*u"]
-    ar_pats = [r"^ar\s*:\s*cout\s*de\s*lancement.*f", r"^ar\b.*lancement.*f"]
-
     for code in codes:
         feuille = _trouver_feuille_produit(chemin_excel, code)
-        df_raw = pd.read_excel(chemin_excel, sheet_name=feuille)
-        df = df_raw.copy()
+        df = pd.read_excel(chemin_excel, sheet_name=feuille)
 
-        C_r_col = _find_col(df, cr_pats, regex=True)
-        C_w_col = _find_col(df, cw_pats, regex=True)
-        A_w_col = _find_col(df, aw_pats, regex=True)
-        A_r_col = _find_col(df, ar_pats, regex=True)
+        C_r = df['Cr : cout stockage/article '].iloc[0]
+        C_w = df['Cw : cout stockage\nchez F'].iloc[0]
+        A_w = df['Aw : cout de\nlancement chez U'].iloc[0]
+        A_r = df['Ar : cout de \nlancement chez F'].iloc[0]
 
-        C_r = pd.to_numeric(df[C_r_col].iloc[0], errors="coerce")
-        C_w = pd.to_numeric(df[C_w_col].iloc[0], errors="coerce")
-        A_w = pd.to_numeric(df[A_w_col].iloc[0], errors="coerce")
-        A_r = pd.to_numeric(df[A_r_col].iloc[0], errors="coerce")
-
-        n_val = (A_w * C_r) / (A_r * C_w) if (A_r is not None and C_w is not None and A_r != 0 and C_w != 0) else 1
-        n_val = 1 if (pd.isna(n_val) or n_val < 1) else round(n_val)
+        # n* (arrondi >=1)
+        n_val = (A_w * C_r) / (A_r * C_w)
+        n_val = 1 if n_val < 1 else round(n_val)
         n1, n2 = int(n_val), int(n_val) + 1
         F_n1 = (A_r + A_w / n1) * (n1 * C_w + C_r)
         F_n2 = (A_r + A_w / n2) * (n2 * C_w + C_r)
-        n_star = n1 if (pd.isna(F_n2) or F_n1 <= F_n2) else n2
+        n_star = n1 if F_n1 <= F_n2 else n2
 
-        D = float(df_conso.get(code, 0))
-        tau = 1
-        Qr_star = ((2 * (A_r + A_w / n_star) * D) / (n_star * C_w + C_r * tau)) ** 0.5 if (n_star and C_w is not None and C_r is not None) else 0.0
+        # Demande totale D (déjà agrégée)
+        D = df_conso.get(code, 0)
+        tau = 1  # période (jour)
+
+        Qr_star = ((2 * (A_r + A_w / n_star) * D) / (n_star * C_w + C_r * tau)) ** 0.5
         Qw_star = n_star * Qr_star
 
         qr_map[code] = round(float(Qr_star), 2)
@@ -149,19 +119,14 @@ def compute_qstars(chemin_excel, codes: list):
 # ======================================================
 # PARTIE B : Séries conso/stock journalières
 # ======================================================
-def _series_conso_stock_jour(chemin_excel, feuille: str):
-    df_raw = pd.read_excel(chemin_excel, sheet_name=feuille)
-    df = df_raw.copy()
-    try:
-        date_col = _find_col(df, [r"^date$", r"date"], regex=True, fallback_idx=0)
-        stock_col = _find_col(df, [r"^stock", r"stock.*dispo"], regex=True, fallback_idx=1)
-        conso_col = _find_col(df, [r"^consommation$", r"^conso$", r"demande"], regex=True, fallback_idx=2)
-    except Exception:
-        date_col, stock_col, conso_col = df.columns[:3]
 
-    dates = pd.to_datetime(df[date_col], errors="coerce")
-    conso = pd.to_numeric(df[conso_col], errors="coerce").fillna(0.0).astype(float)
-    stock = pd.to_numeric(df[stock_col], errors="coerce").fillna(0.0).astype(float)
+def _series_conso_stock_jour(chemin_excel, feuille: str):
+    df = pd.read_excel(chemin_excel, sheet_name=feuille)
+    col_date, col_stock, col_conso = df.columns[0], df.columns[1], df.columns[2]
+
+    dates = pd.to_datetime(df[col_date], errors="coerce")
+    conso = pd.to_numeric(df[col_conso], errors="coerce").fillna(0.0).astype(float)
+    stock = pd.to_numeric(df[col_stock], errors="coerce").fillna(0.0).astype(float)
 
     ts_conso = pd.DataFrame({"d": dates, "q": conso}).dropna().sort_values("d").set_index("d")["q"]
     ts_stock = pd.DataFrame({"d": dates, "s": stock}).dropna().sort_values("d").set_index("d")["s"]
@@ -181,6 +146,7 @@ def _somme_intervalle(serie: pd.Series, start_idx: int, intervalle: int) -> floa
 # ======================================================
 # PARTIE C : Méthodes de prévision
 # ======================================================
+
 def _croston_or_sba(x, alpha: float, variant: str = "sba"):
     x = pd.Series(x).fillna(0.0).astype(float).values
     x = np.where(x < 0, 0.0, x)
@@ -216,8 +182,9 @@ def _ses(x, alpha: float):
     return float(l)
 
 # ======================================================
-# PARTIE D : Rolling final (Qr*/Qw*/n* + ROP/SS + statut)
+# PARTIE D : Rolling final (avec Qr*/Qw*/n* + ROP/SS + statut)
 # ======================================================
+
 def rolling_with_new_logic(
     excel_path, product_code, alpha, window_ratio, intervalle,
     delai_usine, delai_fournisseur, service_level, nb_sim, rng_seed,
@@ -239,6 +206,7 @@ def rolling_with_new_logic(
             train = vals[:i]
             date_test = conso_jour.index[i]
 
+            # Prévision par méthode
             if variant == "sba":
                 f = _croston_or_sba(train, alpha, "sba")
             elif variant == "croston":
@@ -253,25 +221,29 @@ def rolling_with_new_logic(
             stock_dispo = _somme_intervalle(stock_jour, i, intervalle)
             stock_apres_intervalle = stock_apres_intervalle + stock_dispo - demande_reelle
 
+            # ROP usine (demande sur delai_usine ~ NB)
             X_Lt = delai_usine * f
             sigma_Lt = sigma * np.sqrt(max(delai_usine, 1e-9))
             var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
-            p_nb = max(min(X_Lt / var_u, 1 - 1e-12), 1e-12)
+            p_nb = min(max(X_Lt / var_u, 1e-12), 1 - 1e-12)
             r_nb = X_Lt**2 / (var_u - X_Lt) if var_u > X_Lt else 1e6
             ROP_u = float(np.percentile(nbinom.rvs(r_nb, p_nb, size=nb_sim, random_state=rng), 100 * service_level))
             SS_u = max(ROP_u - X_Lt, 0.0)
 
+            # ROP fournisseur (demande sur delai total)
             totalL = delai_usine + delai_fournisseur
             X_Lt_Lw = totalL * f
             sigma_Lt_Lw = sigma * np.sqrt(max(totalL, 1e-9))
             var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
-            p_nb_f = max(min(X_Lt_Lw / var_f, 1 - 1e-12), 1e-12)
+            p_nb_f = min(max(X_Lt_Lw / var_f, 1e-12), 1 - 1e-12)
             r_nb_f = X_Lt_Lw**2 / (var_f - X_Lt_Lw) if var_f > X_Lt_Lw else 1e6
             ROP_f = float(np.percentile(nbinom.rvs(r_nb_f, p_nb_f, size=nb_sim, random_state=rng), 100 * service_level))
             SS_f = max(ROP_f - X_Lt_Lw, 0.0)
 
+            # Comparaison à l’intervalle : ROP usine à l’échelle de l’intervalle
             ROP_u_interval = ROP_u * (intervalle / max(delai_usine, 1e-9))
 
+            # Politique de commande : Qr* (pas Qw*)
             if stock_apres_intervalle >= demande_reelle * delai_usine:
                 politique = "pas_de_commande"
             else:
@@ -304,6 +276,7 @@ def rolling_with_new_logic(
 # ======================================================
 # PARTIE E : Charger les meilleurs paramètres + méthode
 # ======================================================
+
 def _normalize_df_best(df_best: pd.DataFrame, method_name: str, pick_metric: str = "RMSE") -> pd.DataFrame:
     metric_key = pick_metric.upper()
     if metric_key == "ABSME":
@@ -311,6 +284,7 @@ def _normalize_df_best(df_best: pd.DataFrame, method_name: str, pick_metric: str
     else:
         a, w, itv, s = f"best_{metric_key}_alpha", f"best_{metric_key}_window", f"best_{metric_key}_interval", f"best_{metric_key}"
 
+    # fallback au cas où
     for cand in [
         (a, w, itv, s),
         ("best_RMSE_alpha", "best_RMSE_window", "best_RMSE_interval", "best_RMSE"),
@@ -321,7 +295,9 @@ def _normalize_df_best(df_best: pd.DataFrame, method_name: str, pick_metric: str
             a, w, itv, s = cand
             break
 
-    out = df_best.rename(columns={a: "alpha", w: "window_ratio", itv: "recalc_interval", s: "score"})
+    out = df_best.rename(columns={
+        a: "alpha", w: "window_ratio", itv: "recalc_interval", s: "score"
+    })
     keep = ["code", "alpha", "window_ratio", "recalc_interval", "score"]
     if "n_points_used" in df_best.columns:
         out["n_points_used"] = df_best["n_points_used"]
@@ -332,7 +308,10 @@ def _normalize_df_best(df_best: pd.DataFrame, method_name: str, pick_metric: str
     out["method"] = method_name
     return out
 
-def select_best_method_from_files(path_ses, path_cro, path_sba, product_filter=None, pick_metric="RMSE"):
+def select_best_method_from_files(
+    path_ses, path_cro, path_sba,
+    product_filter=None, pick_metric="RMSE"
+):
     df_best_SES = pd.read_excel(path_ses)
     df_best_CRO = pd.read_excel(path_cro)
     df_best_SBA = pd.read_excel(path_sba)
@@ -342,32 +321,18 @@ def select_best_method_from_files(path_ses, path_cro, path_sba, product_filter=N
     cand_sba = _normalize_df_best(df_best_SBA, "sba", pick_metric)
 
     candidates = pd.concat([cand_ses, cand_cro, cand_sba], ignore_index=True)
-
     if product_filter:
-        candidates = candidates[candidates["code"].astype(str).isin([str(c) for c in product_filter])].copy()
+        candidates = candidates[candidates["code"].isin(product_filter)].copy()
 
-    candidates["code"] = candidates["code"].astype(str)
-    candidates["score"] = pd.to_numeric(candidates["score"], errors="coerce")
-    candidates = candidates.dropna(subset=["code", "score"]).copy()
-
-    if candidates.empty:
-        raise ValueError("No candidate rows with a valid 'score'. Check your best_params files and product codes.")
-
+    # meilleure ligne par article (score min)
     idx = candidates.groupby("code")["score"].idxmin()
-    idx = idx.dropna().astype(int)
-
     best_per_code = candidates.loc[idx].sort_values(["code"]).reset_index(drop=True)
-
-    if product_filter:
-        missing = sorted(set(map(str, product_filter)) - set(best_per_code["code"]))
-        if missing:
-            st.warning("⚠️ Aucune ligne valide pour: " + ", ".join(missing))
-
     return best_per_code
 
 # ======================================================
-# PARTIE F : Final (SL unique) + Sensibilité
+# PARTIE F : Final (SL unique) + Sensibilité (plusieurs SL)
 # ======================================================
+
 def run_final_once(best_per_code: pd.DataFrame, service_level=0.95, excel_path_data=None):
     qr_map, qw_map, n_map = compute_qstars(excel_path_data, best_per_code["code"].tolist())
     results = []
@@ -421,6 +386,7 @@ def run_sensitivity(best_per_code: pd.DataFrame, service_levels=[0.90, 0.92, 0.9
         df_concat = pd.concat(runs, ignore_index=True) if runs else pd.DataFrame()
         all_results.append(df_concat)
 
+        # Aperçu par article : moyennes ROP & SS + parts holding/rupture + rappel n*
         if not df_concat.empty:
             grp = df_concat.groupby("code").agg(
                 ROP_usine_moy=("ROP_usine", "mean"),
@@ -440,9 +406,10 @@ def run_sensitivity(best_per_code: pd.DataFrame, service_levels=[0.90, 0.92, 0.9
 # ============================================
 # STREAMLIT APP
 # ============================================
+
 def main():
     st.title("📦 Simulation d'inventaire – Final & Sensibilité")
-    st.caption("Version Streamlit robuste aux variations de feuilles/colonnes")
+    st.caption("Version Streamlit dérivée du script d'origine (logique inchangée, UI ajoutée)")
 
     # Sidebar – fichiers
     st.sidebar.header("Fichiers d'entrée")
@@ -451,10 +418,39 @@ def main():
     best_cro = st.sidebar.file_uploader("Paramètres CROSTON", type=["xlsx", "xls"], key="cro")
     best_sba = st.sidebar.file_uploader("Paramètres SBA", type=["xlsx", "xls"], key="sba")
 
+    # --- NEW: articles.xlsx uploader + sheet picker + auto codes ---
+    articles_file = st.sidebar.file_uploader(
+        "Matrice d'articles (articles.xlsx)", type=["xlsx", "xls"], key="articles"
+    )
+
+    available_codes = None
+    if articles_file is not None:
+        xls = pd.ExcelFile(articles_file)
+        sheet_names = xls.sheet_names
+        # default to 'classification' if present (case-insensitive)
+        default_idx = 0
+        for i, s in enumerate(sheet_names):
+            if str(s).strip().lower() == "classification":
+                default_idx = i
+                break
+        sheet_choice = st.sidebar.selectbox("Feuille matrice", options=sheet_names, index=default_idx)
+        df_matrix = pd.read_excel(articles_file, sheet_name=sheet_choice)
+        prod_col = df_matrix.columns[0]
+        available_codes = df_matrix[prod_col].astype(str).dropna().unique().tolist()
+
     # Sidebar – paramètres
     st.sidebar.header("Paramètres")
-    codes_text = st.sidebar.text_input("Codes produits (séparés par des virgules)", ", ".join(CODES_PRODUITS_DEFAULT))
-    codes_products = [c.strip() for c in codes_text.split(",") if c.strip()]
+
+    # If we have the matrix, pick codes from it; otherwise fallback to manual input
+    if available_codes:
+        codes_products = st.sidebar.multiselect(
+            "Codes produits (depuis articles.xlsx)",
+            options=available_codes,
+            default=available_codes
+        )
+    else:
+        codes_text = st.sidebar.text_input("Codes produits (séparés par des virgules)", ", ".join(CODES_PRODUITS_DEFAULT))
+        codes_products = [c.strip() for c in codes_text.split(",") if c.strip()]
 
     pick_metric = st.sidebar.selectbox("Métrique d'optimisation", ["RMSE", "MSE", "ME", "ABSME"], index=0)
 
@@ -475,7 +471,11 @@ def main():
 
     # Pre-flight checks
     if not (excel_data and best_ses and best_cro and best_sba):
-        st.info("Chargez les 4 fichiers Excel dans la barre latérale pour lancer les calculs.")
+        st.info("Chargez les 4 fichiers Excel (PFE HANIN + best_params) dans la barre latérale pour lancer les calculs.")
+        return
+
+    if not codes_products:
+        st.warning("Aucun code produit sélectionné.")
         return
 
     # Best per code
@@ -510,6 +510,7 @@ def main():
 
     with tab3:
         st.markdown("### Résumé global (par code & SL)")
+        # Use sensi_df if available from tab2
         if 'sensi_df' in locals() and sensi_df is not None and not sensi_df.empty:
             summary = sensi_df.groupby(["code", "service_level"]).agg(
                 ROP_u_moy=("ROP_usine", "mean"),

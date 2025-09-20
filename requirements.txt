@@ -1,1 +1,7 @@
+streamlit>=1.36,<2
+pandas>=2.2
+numpy>=1.26
+scipy>=1.11
+openpyxl>=3.1      # read .xlsx via pandas
+xlrd>=2.0          # read legacy .xls via pandas
 
